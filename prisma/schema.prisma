@@ -1,0 +1,253 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum WorkType {
+  ANIME
+  GAME
+}
+
+enum RatingSource {
+  IMDB
+  ANILIST
+  MAL
+  STEAM
+}
+
+enum DigestStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum ScanStatus {
+  IDLE
+  SCANNING
+  COMPLETE
+  ERROR
+}
+
+model User {
+  id                 String                @id @default(cuid())
+  displayName        String
+  email              String?               @unique
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  preferences        Preference?
+  recommendationRuns RecommendationRun[]
+  watchProgress      WatchProgress[]
+  libraryRoots       LibraryRoot[]
+  askQueries         AskQuery[]
+}
+
+
+model AskQuery {
+  id         String   @id @default(cuid())
+  userId     String
+  query      String
+  type       WorkType
+  answeredAt DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Preference {
+  id                 String   @id @default(cuid())
+  userId             String   @unique
+  newsDigestTime     String   @default("09:00")
+  timezone           String   @default("Asia/Shanghai")
+  favoriteAnime      String   @default("[]")
+  favoriteGames      String   @default("[]")
+  preferredTags      String   @default("[]")
+  excludedTags       String   @default("[]")
+  preferredPlatforms String   @default("[]")
+  apiKeys            String   @default("{}")
+  proxyEnabled       Boolean  @default(false)
+  proxyUrl           String?
+  llmEnabled         Boolean  @default(false)
+  llmBaseUrl         String?
+  llmModel           String?
+  llmTranslateNews   Boolean  @default(true)
+  llmSummarizeNews   Boolean  @default(true)
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model NewsSource {
+  id        String        @id @default(cuid())
+  name      String
+  url       String
+  kind      String        @default("rss")
+  enabled   Boolean       @default(true)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  articles  NewsArticle[]
+}
+
+model NewsArticle {
+  id          String              @id @default(cuid())
+  sourceId    String
+  externalId  String?
+  title       String
+  originalTitle String?
+  url         String              @unique
+  summary     String
+  originalSummary String?
+  category    String
+  keywords    String              @default("[]")
+  publishedAt DateTime
+  createdAt   DateTime            @default(now())
+  source      NewsSource          @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  digests     DailyDigestArticle[]
+}
+
+model DailyDigest {
+  id         String              @id @default(cuid())
+  digestDate DateTime            @unique
+  title      String
+  summary    String
+  status     DigestStatus        @default(PUBLISHED)
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+  articles   DailyDigestArticle[]
+}
+
+model DailyDigestArticle {
+  digestId  String
+  articleId String
+  position  Int
+  digest    DailyDigest @relation(fields: [digestId], references: [id], onDelete: Cascade)
+  article   NewsArticle @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@id([digestId, articleId])
+}
+
+model Work {
+  id                 String                 @id @default(cuid())
+  title              String
+  type               WorkType
+  description        String
+  genres             String                 @default("[]")
+  platforms          String                 @default("[]")
+  releaseYear        Int?
+  episodeCount       Int?
+  creator            String?
+  publisher          String?
+  providerId         String?
+  externalId         String?
+  coverImage         String?
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+  aliases            WorkAlias[]
+  ratings            Rating[]
+  offers             GameOffer[]
+  priceSnapshots     PriceHistorySnapshot[]
+  recommendationRuns RecommendationRun[]
+  libraryItems       LibraryItem[]
+}
+
+model WorkAlias {
+  id     String @id @default(cuid())
+  workId String
+  alias  String
+  locale String?
+  work   Work   @relation(fields: [workId], references: [id], onDelete: Cascade)
+}
+
+model Rating {
+  id        String       @id @default(cuid())
+  workId    String
+  source    RatingSource
+  value     Float
+  scale     Float        @default(10)
+  votes     Int?
+  label     String?
+  url       String?
+  updatedAt DateTime     @updatedAt
+  work      Work         @relation(fields: [workId], references: [id], onDelete: Cascade)
+}
+
+model GameOffer {
+  id            String   @id @default(cuid())
+  workId        String
+  store         String
+  region        String
+  currentPrice  Float?
+  originalPrice Float?
+  currency      String   @default("CNY")
+  discountText  String?
+  storeUrl      String?
+  updatedAt     DateTime @updatedAt
+  work          Work     @relation(fields: [workId], references: [id], onDelete: Cascade)
+}
+
+model PriceHistorySnapshot {
+  id         String   @id @default(cuid())
+  workId     String
+  region     String
+  price      Float
+  currency   String   @default("CNY")
+  observedAt DateTime @default(now())
+  work       Work     @relation(fields: [workId], references: [id], onDelete: Cascade)
+}
+
+model RecommendationRun {
+  id        String   @id @default(cuid())
+  userId    String
+  workId    String
+  inputs    String
+  score     Float
+  rationale String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  work      Work     @relation(fields: [workId], references: [id], onDelete: Cascade)
+}
+
+model LibraryRoot {
+  id         String      @id @default(cuid())
+  userId     String
+  path       String      @unique
+  label      String
+  lastScanAt DateTime?
+  scanStatus ScanStatus  @default(IDLE)
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items      LibraryItem[]
+}
+
+model LibraryItem {
+  id           String      @id @default(cuid())
+  rootId        String
+  workId        String?
+  filePath      String      @unique
+  fileName      String
+  extension     String
+  sizeBytes     BigInt?
+  detectedTitle String
+  seasonLabel   String?
+  isMissing     Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  root          LibraryRoot @relation(fields: [rootId], references: [id], onDelete: Cascade)
+  work          Work?       @relation(fields: [workId], references: [id], onDelete: SetNull)
+  episodes      Episode[]
+}
+
+model Episode {
+  id            String      @id @default(cuid())
+  libraryItemId String
+  episodeNumber Int?
+  rawLabel      String
+  libraryItem   LibraryItem @relation(fields: [libraryItemId], references: [id], onDelete: Cascade)
+}
+
+model WatchProgress {
+  id          String   @id @default(cuid())
+  userId      String
+  workTitle   String
+  lastEpisode Int      @default(0)
+  status      String   @default("watching")
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
