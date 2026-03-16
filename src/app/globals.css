@@ -363,10 +363,10 @@ select {
 .digest-row-track {
   display: flex;
   gap: 14px;
-  overflow-x: auto;
+  overflow-x: scroll;
   padding: 10px 4px 12px;
-  scroll-snap-type: x proximity;
-  scroll-behavior: smooth;
+  scroll-snap-type: none;
+  scroll-behavior: auto;
   overscroll-behavior-x: contain;
   align-items: stretch;
 }
@@ -384,7 +384,7 @@ select {
   flex: 0 0 min(360px, 82vw);
   display: grid;
   gap: 10px;
-  scroll-snap-align: center;
+  scroll-snap-align: none;
   cursor: pointer;
   transition:
     transform 0.36s cubic-bezier(0.18, 0.89, 0.32, 1.28),

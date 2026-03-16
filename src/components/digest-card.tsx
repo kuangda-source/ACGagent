@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import type { WheelEvent as ReactWheelEvent } from "react";
 import type { DailyDigestView, NewsArticleSummary, NewsBriefView } from "@/lib/types";
 
 const sectionConfig = [
@@ -45,6 +46,7 @@ function toSorted(items: NewsArticleSummary[]) {
 
 export function DigestCard({ digest }: { digest: DailyDigestView }) {
   const rootRef = useRef<HTMLElement | null>(null);
+  const activeTrackRef = useRef<HTMLDivElement | null>(null);
   const [activeArticle, setActiveArticle] = useState<NewsArticleSummary | null>(null);
   const [briefById, setBriefById] = useState<Record<string, NewsBriefView>>({});
   const [loadingArticleId, setLoadingArticleId] = useState<string | null>(null);
@@ -160,49 +162,75 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
     };
   }, [digest.id, digest.highlights]);
 
-  useEffect(() => {
-    const root = rootRef.current;
-    if (!root) {
+  function resolveWheelStep(deltaX: number, deltaY: number, deltaMode: number, containerWidth: number) {
+    const dominantDelta = Math.abs(deltaY) >= Math.abs(deltaX) ? deltaY : deltaX;
+    if (Math.abs(dominantDelta) < 0.5) {
+      return 0;
+    }
+
+    let step = dominantDelta;
+    if (deltaMode === 1) {
+      step *= 36;
+    } else if (deltaMode === 2) {
+      step *= containerWidth;
+    }
+    return step * 1.2;
+  }
+
+  function scrollTrackWithWheel(track: HTMLDivElement, event: { deltaX: number; deltaY: number; deltaMode: number }) {
+    if (track.scrollWidth <= track.clientWidth) {
+      return false;
+    }
+
+    const step = resolveWheelStep(event.deltaX, event.deltaY, event.deltaMode, track.clientWidth);
+    if (Math.abs(step) < 0.5) {
+      return false;
+    }
+
+    track.scrollLeft += step;
+    return true;
+  }
+
+  function onTrackWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    const consumed = scrollTrackWithWheel(event.currentTarget, {
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      deltaMode: event.deltaMode
+    });
+
+    if (!consumed) {
       return;
     }
 
-    const tracks = Array.from(root.querySelectorAll<HTMLDivElement>(".digest-row-track"));
-    const removers: Array<() => void> = [];
+    event.preventDefault();
+    event.stopPropagation();
+  }
 
-    for (const track of tracks) {
-      const onWheel = (event: WheelEvent) => {
-        if (track.scrollWidth <= track.clientWidth) {
-          return;
-        }
-
-        const dominantDelta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
-        if (Math.abs(dominantDelta) < 0.5) {
-          return;
-        }
-
-        let step = dominantDelta;
-        if (event.deltaMode === 1) {
-          step *= 36;
-        } else if (event.deltaMode === 2) {
-          step *= track.clientWidth;
-        }
-
-        event.preventDefault();
-        track.scrollLeft += step * 1.2;
-      };
-
-      track.addEventListener("wheel", onWheel, { passive: false });
-      removers.push(() => {
-        track.removeEventListener("wheel", onWheel);
-      });
-    }
-
-    return () => {
-      for (const remove of removers) {
-        remove();
+  useEffect(() => {
+    const onWindowWheel = (event: WheelEvent) => {
+      const track = activeTrackRef.current;
+      if (!track || !document.body.contains(track)) {
+        return;
       }
+
+      const consumed = scrollTrackWithWheel(track, {
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        deltaMode: event.deltaMode
+      });
+
+      if (!consumed) {
+        return;
+      }
+
+      event.preventDefault();
     };
-  }, [groupedSections]);
+
+    window.addEventListener("wheel", onWindowWheel, { passive: false });
+    return () => {
+      window.removeEventListener("wheel", onWindowWheel);
+    };
+  }, []);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -252,8 +280,19 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
               {section.items.length === 0 ? (
                 <div className="empty">暂无内容</div>
               ) : (
-                <div className={`digest-row-track ${hoveredId ? "has-hover" : ""}`}>
-                  {section.items.map((article, index) => {
+                <div
+                  className={`digest-row-track ${hoveredId ? "has-hover" : ""}`}
+                  onWheel={onTrackWheel}
+                  onMouseEnter={(event) => {
+                    activeTrackRef.current = event.currentTarget;
+                  }}
+                  onMouseLeave={(event) => {
+                    if (activeTrackRef.current === event.currentTarget) {
+                      activeTrackRef.current = null;
+                    }
+                  }}
+                >
+                  {section.items.map((article) => {
                     const isHovered = hoveredId === article.id;
                     const isDimmed = Boolean(hoveredId && hoveredId !== article.id);
                     return (
