@@ -367,7 +367,7 @@ select {
   padding: 10px 4px 12px;
   scroll-snap-type: none;
   scroll-behavior: auto;
-  overscroll-behavior-x: contain;
+  overscroll-behavior: contain;
   align-items: stretch;
 }
 

@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
-import type { WheelEvent as ReactWheelEvent } from "react";
 import type { DailyDigestView, NewsArticleSummary, NewsBriefView } from "@/lib/types";
 
 const sectionConfig = [
@@ -46,7 +45,6 @@ function toSorted(items: NewsArticleSummary[]) {
 
 export function DigestCard({ digest }: { digest: DailyDigestView }) {
   const rootRef = useRef<HTMLElement | null>(null);
-  const activeTrackRef = useRef<HTMLDivElement | null>(null);
   const [activeArticle, setActiveArticle] = useState<NewsArticleSummary | null>(null);
   const [briefById, setBriefById] = useState<Record<string, NewsBriefView>>({});
   const [loadingArticleId, setLoadingArticleId] = useState<string | null>(null);
@@ -191,46 +189,48 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
     return true;
   }
 
-  function onTrackWheel(event: ReactWheelEvent<HTMLDivElement>) {
-    const consumed = scrollTrackWithWheel(event.currentTarget, {
-      deltaX: event.deltaX,
-      deltaY: event.deltaY,
-      deltaMode: event.deltaMode
-    });
-
-    if (!consumed) {
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) {
       return;
     }
 
-    event.preventDefault();
-    event.stopPropagation();
-  }
+    const tracks = Array.from(root.querySelectorAll<HTMLDivElement>(".digest-row-track"));
+    const removers: Array<() => void> = [];
 
-  useEffect(() => {
-    const onWindowWheel = (event: WheelEvent) => {
-      const track = activeTrackRef.current;
-      if (!track || !document.body.contains(track)) {
-        return;
-      }
+    for (const track of tracks) {
+      const onWheel = (event: WheelEvent) => {
+        if (track.scrollWidth <= track.clientWidth) {
+          return;
+        }
 
-      const consumed = scrollTrackWithWheel(track, {
-        deltaX: event.deltaX,
-        deltaY: event.deltaY,
-        deltaMode: event.deltaMode
+        const consumed = scrollTrackWithWheel(track, {
+          deltaX: event.deltaX,
+          deltaY: event.deltaY,
+          deltaMode: event.deltaMode
+        });
+
+        // Block page vertical scrolling while pointer is over horizontal news rows.
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (!consumed) {
+          return;
+        }
+      };
+
+      track.addEventListener("wheel", onWheel, { passive: false });
+      removers.push(() => {
+        track.removeEventListener("wheel", onWheel);
       });
+    }
 
-      if (!consumed) {
-        return;
-      }
-
-      event.preventDefault();
-    };
-
-    window.addEventListener("wheel", onWindowWheel, { passive: false });
     return () => {
-      window.removeEventListener("wheel", onWindowWheel);
+      for (const remove of removers) {
+        remove();
+      }
     };
-  }, []);
+  }, [groupedSections]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -282,15 +282,6 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
               ) : (
                 <div
                   className={`digest-row-track ${hoveredId ? "has-hover" : ""}`}
-                  onWheel={onTrackWheel}
-                  onMouseEnter={(event) => {
-                    activeTrackRef.current = event.currentTarget;
-                  }}
-                  onMouseLeave={(event) => {
-                    if (activeTrackRef.current === event.currentTarget) {
-                      activeTrackRef.current = null;
-                    }
-                  }}
                 >
                   {section.items.map((article) => {
                     const isHovered = hoveredId === article.id;
