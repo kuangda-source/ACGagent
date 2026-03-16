@@ -1,10 +1,12 @@
 ﻿import Parser from "rss-parser";
 import { fetch } from "undici";
 import type { DailyDigestView, NewsArticleSummary } from "@/lib/types";
+import { prisma } from "@/lib/prisma";
 import { getAppStore } from "@/server/persistence/app-state";
 import { getSettings } from "@/server/settings/service";
 import { translateNewsBatch } from "@/server/providers/llm-provider";
 import { closeDispatcher, createRequestDispatcher } from "@/server/providers/shared";
+import { warmNewsBriefCache } from "@/server/news/brief-service";
 
 interface Source {
   id: string;
@@ -130,7 +132,7 @@ function isAcgRelevant(title: string, summary: string, categories: string[], sou
   }
 
   const text = `${title} ${summary} ${categories.join(" ")}`.toLowerCase();
-  return /(anime|animation|manga|comic|acg|otaku|jrpg|rpg|steam|playstation|xbox|switch|nintendo|gacha|visual novel|hoyoverse|mihoyo|动漫|动画|番剧|漫画|国漫|二次元|游戏|主机|手游|网游|steam|米哈游|声优|剧场版|漫展|cosplay|coser)/.test(
+  return /(anime|animation|manga|comic|acg|otaku|jrpg|rpg|steam|playstation|xbox|switch|nintendo|gacha|visual novel|hoyoverse|mihoyo|动漫|动画|番剧|漫画|国漫|二次元|游戏|主机|手游|网游|米哈游|声优|剧场版|漫展|cosplay|coser)/.test(
     text
   );
 }
@@ -203,6 +205,27 @@ function yesterdayDateKey(timezone: string, now = new Date()) {
   return `${localNow.getFullYear()}-${`${localNow.getMonth() + 1}`.padStart(2, "0")}-${`${localNow.getDate()}`.padStart(2, "0")}`;
 }
 
+function dateKeyToUtcDate(dateKey: string) {
+  return new Date(`${dateKey}T00:00:00.000Z`);
+}
+
+function utcDateToDateKey(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function parseKeywords(raw: string) {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [] as string[];
+    }
+
+    return parsed.map((item) => String(item));
+  } catch {
+    return [] as string[];
+  }
+}
+
 function dedupeArticles(items: NewsArticleSummary[]) {
   const map = new Map<string, NewsArticleSummary>();
 
@@ -218,66 +241,52 @@ function dedupeArticles(items: NewsArticleSummary[]) {
   return [...map.values()];
 }
 
-function balanceHighlights(items: NewsArticleSummary[], maxCount: number) {
-  const sourceCap = 4;
+const DIGEST_SECTION_TARGETS = [
+  {
+    key: "anime",
+    categories: new Set<NewsCategory>(["anime", "industry", "event", "other"]),
+    min: 5,
+    max: 10
+  },
+  {
+    key: "comic",
+    categories: new Set<NewsCategory>(["comic"]),
+    min: 5,
+    max: 10
+  },
+  {
+    key: "game",
+    categories: new Set<NewsCategory>(["game"]),
+    min: 5,
+    max: 10
+  }
+] as const;
+
+function sortByPublishedDesc(items: NewsArticleSummary[]) {
+  return [...items].sort((a, b) => +new Date(b.publishedAt) - +new Date(a.publishedAt));
+}
+
+function pickForSection(
+  items: NewsArticleSummary[],
+  categories: Set<NewsCategory>,
+  maxCount: number,
+  selectedUrls: Set<string>
+) {
+  const sourceCap = 5;
   const sourceCount = new Map<string, number>();
+  const picked: NewsArticleSummary[] = [];
 
-  const byCategory = new Map<NewsCategory, NewsArticleSummary[]>([
-    ["anime", []],
-    ["comic", []],
-    ["game", []],
-    ["industry", []],
-    ["event", []],
-    ["other", []]
-  ]);
-
-  for (const item of items.sort((a, b) => +new Date(b.publishedAt) - +new Date(a.publishedAt))) {
-    const key = normalizeCategory(item.category);
-    byCategory.get(key)?.push(item);
-  }
-
-  const result: NewsArticleSummary[] = [];
-
-  const rounds: Array<Array<NewsCategory>> = [
-    ["anime", "comic", "game"],
-    ["anime", "comic", "game"],
-    ["anime", "game", "comic"],
-    ["industry", "event", "other"]
-  ];
-
-  for (const order of rounds) {
-    for (const category of order) {
-      if (result.length >= maxCount) {
-        return result;
-      }
-
-      const list = byCategory.get(category) ?? [];
-      while (list.length > 0) {
-        const candidate = list.shift();
-        if (!candidate) {
-          break;
-        }
-
-        const count = sourceCount.get(candidate.sourceName) ?? 0;
-        if (count >= sourceCap) {
-          continue;
-        }
-
-        sourceCount.set(candidate.sourceName, count + 1);
-        result.push(candidate);
-        break;
-      }
-    }
-  }
-
-  if (result.length >= maxCount) {
-    return result.slice(0, maxCount);
-  }
-
-  const leftovers = [...byCategory.values()].flat();
-  for (const item of leftovers) {
-    if (result.length >= maxCount) {
+  for (const item of items) {
+    if (picked.length >= maxCount) {
       break;
+    }
+
+    if (selectedUrls.has(item.url)) {
+      continue;
+    }
+
+    if (!categories.has(normalizeCategory(item.category))) {
+      continue;
     }
 
     const count = sourceCount.get(item.sourceName) ?? 0;
@@ -286,21 +295,40 @@ function balanceHighlights(items: NewsArticleSummary[], maxCount: number) {
     }
 
     sourceCount.set(item.sourceName, count + 1);
-    result.push(item);
+    selectedUrls.add(item.url);
+    picked.push(item);
   }
 
-  return result;
+  return picked;
 }
 
 function pickHighlights(all: NewsArticleSummary[], timezone: string, dateKey: string) {
-  const yesterday = all.filter((item) => toDateKeyInTimezone(new Date(item.publishedAt), timezone) === dateKey);
+  const sortedAll = sortByPublishedDesc(all);
+  const yesterday = sortedAll.filter((item) => toDateKeyInTimezone(new Date(item.publishedAt), timezone) === dateKey);
+  const recentWindow = sortedAll.filter((item) => Date.now() - new Date(item.publishedAt).getTime() <= 14 * 24 * 60 * 60 * 1000);
+  const selectedUrls = new Set<string>();
+  const result: NewsArticleSummary[] = [];
 
-  const pool =
-    yesterday.length >= 6
-      ? yesterday
-      : all.filter((item) => Date.now() - new Date(item.publishedAt).getTime() <= 72 * 60 * 60 * 1000);
+  for (const section of DIGEST_SECTION_TARGETS) {
+    const primary = pickForSection(yesterday, section.categories, section.max, selectedUrls);
+    result.push(...primary);
+    let sectionCount = primary.length;
 
-  return balanceHighlights(pool, 12);
+    if (primary.length < section.min) {
+      const need = section.min - primary.length;
+      const supplement = pickForSection(recentWindow, section.categories, need, selectedUrls);
+      result.push(...supplement);
+      sectionCount += supplement.length;
+    }
+
+    if (sectionCount < section.max) {
+      const remaining = section.max - sectionCount;
+      const extra = pickForSection(recentWindow, section.categories, remaining, selectedUrls);
+      result.push(...extra);
+    }
+  }
+
+  return sortByPublishedDesc(result);
 }
 
 function buildNoDataHighlights(dateKey: string): NewsArticleSummary[] {
@@ -332,6 +360,7 @@ function categoryLabel(category: string) {
       return "其他";
   }
 }
+
 function summarizeDigest(highlights: NewsArticleSummary[], dateKey: string) {
   const categoryCount = new Map<string, number>();
 
@@ -345,6 +374,14 @@ function summarizeDigest(highlights: NewsArticleSummary[], dateKey: string) {
     .join("，");
 
   return `${dateKey} 共整理 ${highlights.length} 条 ACG 新闻，分类分布：${summary || "暂无"}。`;
+}
+
+function sourceHomepage(item: NewsArticleSummary) {
+  try {
+    return new URL(item.url).origin;
+  } catch {
+    return "https://local.acgagent";
+  }
 }
 
 async function fetchSourceArticles(source: Source, dispatcher?: import("undici").Dispatcher): Promise<NewsArticleSummary[]> {
@@ -364,36 +401,239 @@ async function fetchSourceArticles(source: Source, dispatcher?: import("undici")
 
     const xml = await response.text();
     const feed = await parser.parseString(xml);
-    const items = (feed.items ?? []).slice(0, 30);
+    const items = (feed.items ?? []).slice(0, 60);
 
     return items
       .map((item, index) => {
-      const title = normalizeText(item.title, `Untitled ${index + 1}`);
-      const originalSummary = normalizeText(item.contentSnippet ?? item.content ?? item.summary, "暂无摘要");
-      const summary = originalSummary.slice(0, 220);
-      const publishedAt = safeIsoDate(item.isoDate ?? item.pubDate);
-      const url = safeUrl(item.link, source.homepage);
-      const categories = Array.isArray(item.categories) ? item.categories.map((c) => String(c)) : [];
-      const category = detectCategory(title, summary, source, categories);
+        const title = normalizeText(item.title, `Untitled ${index + 1}`);
+        const originalSummary = normalizeText(item.contentSnippet ?? item.content ?? item.summary, "暂无摘要");
+        const summary = originalSummary.slice(0, 280);
+        const publishedAt = safeIsoDate(item.isoDate ?? item.pubDate);
+        const url = safeUrl(item.link, source.homepage);
+        const categories = Array.isArray(item.categories) ? item.categories.map((c) => String(c)) : [];
+        const category = detectCategory(title, summary, source, categories);
 
-      return {
-        id: buildArticleId(source.id, url, title),
-        sourceId: source.id,
-        title,
-        originalTitle: title,
-        url,
-        summary,
-        originalSummary,
-        category,
-        keywords: categories,
-        sourceName: source.name,
-        publishedAt
-      } satisfies NewsArticleSummary;
+        return {
+          id: buildArticleId(source.id, url, title),
+          sourceId: source.id,
+          title,
+          originalTitle: title,
+          url,
+          summary,
+          originalSummary,
+          category,
+          keywords: categories,
+          sourceName: source.name,
+          publishedAt
+        } satisfies NewsArticleSummary;
       })
       .filter((item) => isAcgRelevant(item.title, item.summary, item.keywords ?? [], source));
   } catch {
     return [];
   }
+}
+
+async function persistDigest(digest: DailyDigestView) {
+  const digestDate = dateKeyToUtcDate(digest.digestDate);
+
+  await prisma.$transaction(async (tx) => {
+    for (const source of sources) {
+      await tx.newsSource.upsert({
+        where: { id: source.id },
+        update: {
+          name: source.name,
+          url: source.homepage,
+          kind: "rss",
+          enabled: true
+        },
+        create: {
+          id: source.id,
+          name: source.name,
+          url: source.homepage,
+          kind: "rss",
+          enabled: true
+        }
+      });
+    }
+
+    const articles = [] as Array<{ articleId: string; position: number }>;
+
+    for (const [position, item] of digest.highlights.entries()) {
+      const sourceId = (item.sourceId ?? "").trim() || `source-${item.sourceName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "unknown"}`;
+
+      await tx.newsSource.upsert({
+        where: { id: sourceId },
+        update: {
+          name: item.sourceName,
+          url: sourceHomepage(item),
+          kind: "rss",
+          enabled: true
+        },
+        create: {
+          id: sourceId,
+          name: item.sourceName,
+          url: sourceHomepage(item),
+          kind: "rss",
+          enabled: true
+        }
+      });
+
+      const article = await tx.newsArticle.upsert({
+        where: { url: item.url },
+        update: {
+          sourceId,
+          externalId: item.id,
+          title: item.title,
+          originalTitle: item.originalTitle,
+          summary: item.summary,
+          originalSummary: item.originalSummary,
+          category: item.category,
+          keywords: JSON.stringify(item.keywords ?? []),
+          publishedAt: new Date(item.publishedAt)
+        },
+        create: {
+          sourceId,
+          externalId: item.id,
+          title: item.title,
+          originalTitle: item.originalTitle,
+          url: item.url,
+          summary: item.summary,
+          originalSummary: item.originalSummary,
+          category: item.category,
+          keywords: JSON.stringify(item.keywords ?? []),
+          publishedAt: new Date(item.publishedAt)
+        }
+      });
+
+      articles.push({ articleId: article.id, position });
+    }
+
+    const digestRecord = await tx.dailyDigest.upsert({
+      where: { digestDate },
+      update: {
+        title: digest.title,
+        summary: digest.summary,
+        status: "PUBLISHED"
+      },
+      create: {
+        digestDate,
+        title: digest.title,
+        summary: digest.summary,
+        status: "PUBLISHED"
+      }
+    });
+
+    await tx.dailyDigestArticle.deleteMany({
+      where: { digestId: digestRecord.id }
+    });
+
+    if (articles.length > 0) {
+      await tx.dailyDigestArticle.createMany({
+        data: articles.map((entry) => ({
+          digestId: digestRecord.id,
+          articleId: entry.articleId,
+          position: entry.position
+        }))
+      });
+    }
+  });
+}
+
+async function readDigestFromDb(dateKey: string) {
+  const digest = await prisma.dailyDigest.findUnique({
+    where: {
+      digestDate: dateKeyToUtcDate(dateKey)
+    },
+    include: {
+      articles: {
+        orderBy: {
+          position: "asc"
+        },
+        include: {
+          article: {
+            include: {
+              source: true
+            }
+          }
+        }
+      }
+    }
+  });
+
+  return digest;
+}
+
+function mapDbDigestToView(
+  digest:
+    | (Awaited<ReturnType<typeof readDigestFromDb>> & {
+        articles: Array<{
+          article: {
+            id: string;
+            externalId: string | null;
+            title: string;
+            originalTitle: string | null;
+            url: string;
+            summary: string;
+            originalSummary: string | null;
+            category: string;
+            keywords: string;
+            publishedAt: Date;
+            source: {
+              id: string;
+              name: string;
+            };
+          };
+        }>;
+      })
+    | null
+): DailyDigestView | null {
+  if (!digest) {
+    return null;
+  }
+
+  return {
+    id: digest.id,
+    title: digest.title,
+    digestDate: utcDateToDateKey(digest.digestDate),
+    summary: digest.summary,
+    highlights: digest.articles.map((entry) => ({
+      id: entry.article.externalId ?? entry.article.id,
+      sourceId: entry.article.source.id,
+      title: entry.article.title,
+      originalTitle: entry.article.originalTitle ?? undefined,
+      url: entry.article.url,
+      summary: entry.article.summary,
+      originalSummary: entry.article.originalSummary ?? undefined,
+      category: entry.article.category,
+      keywords: parseKeywords(entry.article.keywords),
+      sourceName: entry.article.source.name,
+      publishedAt: entry.article.publishedAt.toISOString()
+    }))
+  };
+}
+
+async function readLatestDigestFromDb() {
+  const digest = await prisma.dailyDigest.findFirst({
+    orderBy: {
+      digestDate: "desc"
+    },
+    include: {
+      articles: {
+        orderBy: {
+          position: "asc"
+        },
+        include: {
+          article: {
+            include: {
+              source: true
+            }
+          }
+        }
+      }
+    }
+  });
+
+  return digest;
 }
 
 export async function refreshDailyDigest(): Promise<DailyDigestView> {
@@ -410,10 +650,6 @@ export async function refreshDailyDigest(): Promise<DailyDigestView> {
     let highlights = pickHighlights(realArticles, timezone, dateKey);
     highlights = await translateNewsBatch(highlights, settings, dispatcher);
 
-    if (highlights.length === 0 && store.latestDigest?.highlights.length) {
-      highlights = store.latestDigest.highlights.filter((item) => !item.url.includes("example.com")).slice(0, 12);
-    }
-
     if (highlights.length === 0) {
       highlights = buildNoDataHighlights(dateKey);
     }
@@ -426,6 +662,11 @@ export async function refreshDailyDigest(): Promise<DailyDigestView> {
       highlights
     };
 
+    await persistDigest(digest);
+    void warmNewsBriefCache(highlights).catch(() => {
+      // Non-blocking warm cache; digest publishing should not be delayed by LLM latency.
+    });
+
     store.latestDigest = digest;
     return digest;
   } finally {
@@ -437,23 +678,28 @@ export async function getLatestDigest(): Promise<DailyDigestView> {
   const store = getAppStore();
   const settings = await getSettings();
   const dateKey = yesterdayDateKey(settings.timezone || "Asia/Shanghai");
-  const latestDigest = store.latestDigest;
 
-  const stale = !latestDigest || latestDigest.digestDate !== dateKey;
-  const hasExampleLink = latestDigest?.highlights.some((item) => item.url.includes("example.com")) ?? false;
-  const hasUntranslatedItem =
-    latestDigest?.highlights.some((item) => !/[\u4e00-\u9fff]/.test(`${item.title} ${item.summary}`)) ?? false;
-
-  if (stale || hasExampleLink || hasUntranslatedItem) {
-    return refreshDailyDigest();
+  const digestForDate = mapDbDigestToView(await readDigestFromDb(dateKey));
+  if (digestForDate) {
+    store.latestDigest = digestForDate;
+    return digestForDate;
   }
 
-  return latestDigest;
+  const latestDigest = mapDbDigestToView(await readLatestDigestFromDb());
+  if (latestDigest) {
+    store.latestDigest = latestDigest;
+    return latestDigest;
+  }
+
+  if (store.latestDigest) {
+    return store.latestDigest;
+  }
+
+  return {
+    id: `digest-${dateKey}`,
+    title: `${dateKey} ACG 雷达`,
+    digestDate: dateKey,
+    summary: `数据库暂无日报数据，请先运行一次新闻任务（npm run job:news）后再刷新页面。`,
+    highlights: buildNoDataHighlights(dateKey)
+  };
 }
-
-
-
-
-
-
-

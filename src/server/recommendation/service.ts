@@ -47,6 +47,18 @@ interface SteamAppDetailResponse {
   data?: SteamAppDetailData;
 }
 
+interface CheapSharkDeal {
+  title: string;
+  dealID: string;
+  gameID: string;
+  steamAppID?: string;
+  salePrice: string;
+  normalPrice: string;
+  savings: string;
+  steamRatingPercent?: string;
+  metacriticScore?: string;
+}
+
 function normalize(value: string) {
   return value.trim().toLowerCase();
 }
@@ -133,6 +145,10 @@ function toFallbackRecommendation(game: WorkDetail, score: number): Recommendati
   };
 }
 
+function formatUsdPriceLabel(normalPrice: number, salePrice: number, discountPercent: number) {
+  return `$${salePrice.toFixed(2)}（-${discountPercent}% / 原价 $${normalPrice.toFixed(2)}）`;
+}
+
 function buildFallbackRecommendations(input: RecommendationInput) {
   const excludedTags = input.excludedTags.filter(Boolean);
 
@@ -145,7 +161,7 @@ function buildFallbackRecommendations(input: RecommendationInput) {
 async function fetchFeaturedDiscounts(dispatcher?: import("undici").Dispatcher): Promise<SteamFeaturedItem[]> {
   const response = await fetch("https://store.steampowered.com/api/featuredcategories?cc=cn&l=schinese", {
     dispatcher,
-    signal: AbortSignal.timeout(8_000)
+    signal: AbortSignal.timeout(12_000)
   });
 
   if (!response.ok) {
@@ -166,6 +182,19 @@ async function fetchFeaturedDiscounts(dispatcher?: import("undici").Dispatcher):
   }
 
   return [...map.values()].sort((a, b) => b.discount_percent - a.discount_percent);
+}
+
+async function fetchCheapSharkDeals(): Promise<CheapSharkDeal[]> {
+  const response = await fetch("https://www.cheapshark.com/api/1.0/deals?storeID=1&pageSize=30&sortBy=Deal%20Rating&desc=1", {
+    signal: AbortSignal.timeout(10_000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`CheapShark deals error: ${response.status}`);
+  }
+
+  const body = (await response.json()) as CheapSharkDeal[];
+  return Array.isArray(body) ? body : [];
 }
 
 async function fetchAppDetail(appId: number, dispatcher?: import("undici").Dispatcher): Promise<SteamAppDetailData | undefined> {
@@ -195,6 +224,51 @@ function isTestEnvironment() {
   return process.env.NODE_ENV === "test" || process.env.VITEST === "true";
 }
 
+function mapCheapSharkDealToRecommendation(deal: CheapSharkDeal, input: RecommendationInput): RecommendationResult | null {
+  const salePrice = Number.parseFloat(deal.salePrice);
+  const normalPrice = Number.parseFloat(deal.normalPrice);
+  const savings = Number.parseFloat(deal.savings);
+
+  if (!Number.isFinite(salePrice) || !Number.isFinite(normalPrice) || !Number.isFinite(savings) || normalPrice <= 0 || salePrice <= 0) {
+    return null;
+  }
+
+  const discountPercent = Math.max(0, Math.round(savings));
+  if (discountPercent <= 0) {
+    return null;
+  }
+
+  const storeUrl = deal.steamAppID ? buildStoreUrl(Number(deal.steamAppID)) : `https://www.cheapshark.com/redirect?dealID=${deal.dealID}`;
+  const genres = ["steam-deal"];
+  const platforms = ["Steam", "Windows"];
+  const ratingPercent = Number.parseFloat(deal.steamRatingPercent ?? "");
+  const ratingBoost = Number.isFinite(ratingPercent) ? Math.min(ratingPercent / 50, 1.8) : 0.5;
+
+  const score =
+    6 +
+    Math.min(discountPercent / 12, 2.4) +
+    ratingBoost +
+    platformPreferenceScore(platforms, input.platform) +
+    likedTitleBoost(deal.title, input.likedTitles);
+
+  const rationaleParts = [`折扣 ${discountPercent}%`, `综合得分 ${score.toFixed(1)}`, "来源：Steam 折扣镜像（实时）"];
+  if (Number.isFinite(ratingPercent)) {
+    rationaleParts.unshift(`Steam 好评率 ${Math.round(ratingPercent)}%`);
+  }
+
+  return {
+    id: `steam-cheapshark-${deal.dealID}`,
+    title: deal.title,
+    score: Number(score.toFixed(1)),
+    genres,
+    platforms,
+    priceLabel: formatUsdPriceLabel(normalPrice, salePrice, discountPercent),
+    rationale: rationaleParts.join("；"),
+    storeUrl,
+    discountPercent
+  };
+}
+
 export async function recommendGames(input: RecommendationInput): Promise<RecommendationResult[]> {
   if (isTestEnvironment()) {
     const fallback = buildFallbackRecommendations(input);
@@ -208,7 +282,13 @@ export async function recommendGames(input: RecommendationInput): Promise<Recomm
   const dispatcher = createRequestDispatcher(settings);
 
   try {
-    const featured = await fetchFeaturedDiscounts(dispatcher);
+    let featured: SteamFeaturedItem[] = [];
+    try {
+      featured = await fetchFeaturedDiscounts(dispatcher);
+    } catch {
+      featured = [];
+    }
+
     const candidates = featured.slice(0, 12);
     const details = await Promise.all(candidates.map((item) => fetchAppDetail(item.id, dispatcher)));
 
@@ -273,9 +353,25 @@ export async function recommendGames(input: RecommendationInput): Promise<Recomm
       return ranked;
     }
   } catch {
-    // Fallback handled below.
+    // CheapShark fallback handled below.
   } finally {
     await closeDispatcher(dispatcher);
+  }
+
+  try {
+    const cheapSharkDeals = await fetchCheapSharkDeals();
+    const cheapSharkResults = cheapSharkDeals
+      .map((deal) => mapCheapSharkDealToRecommendation(deal, input))
+      .filter((item): item is RecommendationResult => Boolean(item))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 6);
+
+    if (cheapSharkResults.length > 0) {
+      getAppStore().recommendationHistory = cheapSharkResults;
+      return cheapSharkResults;
+    }
+  } catch {
+    // Final fallback handled below.
   }
 
   const fallback = buildFallbackRecommendations(input);

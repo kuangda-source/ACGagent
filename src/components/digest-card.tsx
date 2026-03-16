@@ -1,6 +1,7 @@
 ﻿"use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { DailyDigestView, NewsArticleSummary, NewsBriefView } from "@/lib/types";
 
 const sectionConfig = [
@@ -42,46 +43,57 @@ function toSorted(items: NewsArticleSummary[]) {
   return [...items].sort((a, b) => +new Date(b.publishedAt) - +new Date(a.publishedAt));
 }
 
-function featuredIndex(length: number) {
-  if (length <= 0) {
-    return -1;
-  }
-  return Math.floor(length / 2);
-}
-
 export function DigestCard({ digest }: { digest: DailyDigestView }) {
+  const rootRef = useRef<HTMLElement | null>(null);
   const [activeArticle, setActiveArticle] = useState<NewsArticleSummary | null>(null);
   const [briefById, setBriefById] = useState<Record<string, NewsBriefView>>({});
   const [loadingArticleId, setLoadingArticleId] = useState<string | null>(null);
   const [briefError, setBriefError] = useState("");
+  const [hoveredBySection, setHoveredBySection] = useState<Record<string, string | null>>({});
+  const briefRef = useRef<Record<string, NewsBriefView>>({});
+
+  useEffect(() => {
+    briefRef.current = briefById;
+  }, [briefById]);
 
   const groupedSections = useMemo(
     () =>
       sectionConfig.map((section) => ({
         ...section,
-        items: toSorted(digest.highlights.filter((item) => section.categories.has(item.category)))
+        items: toSorted(digest.highlights.filter((item) => section.categories.has(item.category))).slice(0, 10)
       })),
     [digest.highlights]
   );
 
   const activeBrief = activeArticle ? briefById[activeArticle.id] : null;
 
-  async function openBrief(article: NewsArticleSummary) {
-    setActiveArticle(article);
-    setBriefError("");
+  async function fetchBrief(
+    article: NewsArticleSummary,
+    options?: {
+      forceRefresh?: boolean;
+      silent?: boolean;
+    }
+  ) {
+    const forceRefresh = options?.forceRefresh ?? false;
+    const silent = options?.silent ?? false;
 
-    if (briefById[article.id] || loadingArticleId === article.id) {
+    if (!forceRefresh && (briefRef.current[article.id] || loadingArticleId === article.id)) {
       return;
     }
 
-    setLoadingArticleId(article.id);
+    if (!silent) {
+      setLoadingArticleId(article.id);
+    }
     try {
       const response = await fetch("/api/news/brief", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify(article)
+        body: JSON.stringify({
+          ...article,
+          forceRefresh
+        })
       });
 
       if (!response.ok) {
@@ -94,11 +106,103 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
         [article.id]: payload
       }));
     } catch {
-      setBriefError("生成浓缩摘要失败，请稍后重试。");
+      if (!silent) {
+        setBriefError("生成浓缩摘要失败，请稍后重试。");
+      }
     } finally {
-      setLoadingArticleId((current) => (current === article.id ? null : current));
+      if (!silent) {
+        setLoadingArticleId((current) => (current === article.id ? null : current));
+      }
     }
   }
+
+  async function openBrief(article: NewsArticleSummary, options?: { forceRefresh?: boolean }) {
+    setActiveArticle(article);
+    setBriefError("");
+    await fetchBrief(article, {
+      forceRefresh: options?.forceRefresh ?? false,
+      silent: false
+    });
+  }
+
+  function onArticleKeyDown(event: ReactKeyboardEvent<HTMLElement>, article: NewsArticleSummary) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      void openBrief(article);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    const articles = [...digest.highlights];
+    let cursor = 0;
+
+    async function worker() {
+      while (!cancelled) {
+        const article = articles[cursor];
+        cursor += 1;
+
+        if (!article) {
+          break;
+        }
+
+        if (briefRef.current[article.id]) {
+          continue;
+        }
+
+        await fetchBrief(article, { silent: true });
+      }
+    }
+
+    void Promise.all([worker(), worker()]);
+    return () => {
+      cancelled = true;
+    };
+  }, [digest.id, digest.highlights]);
+
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) {
+      return;
+    }
+
+    const tracks = Array.from(root.querySelectorAll<HTMLDivElement>(".digest-row-track"));
+    const removers: Array<() => void> = [];
+
+    for (const track of tracks) {
+      const onWheel = (event: WheelEvent) => {
+        if (track.scrollWidth <= track.clientWidth) {
+          return;
+        }
+
+        const dominantDelta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+        if (Math.abs(dominantDelta) < 0.5) {
+          return;
+        }
+
+        let step = dominantDelta;
+        if (event.deltaMode === 1) {
+          step *= 36;
+        } else if (event.deltaMode === 2) {
+          step *= track.clientWidth;
+        }
+
+        event.preventDefault();
+        track.scrollLeft += step * 1.2;
+      };
+
+      track.addEventListener("wheel", onWheel, { passive: false });
+      removers.push(() => {
+        track.removeEventListener("wheel", onWheel);
+      });
+    }
+
+    return () => {
+      for (const remove of removers) {
+        remove();
+      }
+    };
+  }, [groupedSections]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -121,7 +225,7 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
   }, [activeArticle]);
 
   return (
-    <section className="panel stack">
+    <section ref={rootRef} className="panel stack">
       <div className="card-title">
         <div>
           <h2 className="section-title">{digest.title}</h2>
@@ -137,7 +241,7 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
 
       <div className="digest-rows">
         {groupedSections.map((section) => {
-          const highlightAt = featuredIndex(section.items.length);
+          const hoveredId = hoveredBySection[section.key] ?? null;
           return (
             <section key={section.key} className="digest-row-section">
               <div className="card-title">
@@ -148,14 +252,33 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
               {section.items.length === 0 ? (
                 <div className="empty">暂无内容</div>
               ) : (
-                <div className="digest-row-track">
-                  {section.items.map((article, index) => (
-                    <article key={article.id} className={`list-item digest-row-item ${index === highlightAt ? "is-featured" : ""}`}>
+                <div className={`digest-row-track ${hoveredId ? "has-hover" : ""}`}>
+                  {section.items.map((article, index) => {
+                    const isHovered = hoveredId === article.id;
+                    const isDimmed = Boolean(hoveredId && hoveredId !== article.id);
+                    return (
+                    <article
+                      key={article.id}
+                      className={`list-item digest-row-item ${isHovered ? "is-hovered" : ""} ${
+                        isDimmed ? "is-dimmed" : ""
+                      }`}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`查看新闻浓缩：${article.title}`}
+                      onClick={() => void openBrief(article)}
+                      onKeyDown={(event) => onArticleKeyDown(event, article)}
+                      onMouseEnter={() => setHoveredBySection((current) => ({ ...current, [section.key]: article.id }))}
+                      onMouseLeave={() => setHoveredBySection((current) => ({ ...current, [section.key]: null }))}
+                    >
                       <div className="card-title">
-                        <button type="button" className="news-title-button" onClick={() => void openBrief(article)}>
-                          {article.title}
-                        </button>
-                        <a href={article.url} target="_blank" rel="noreferrer" className="button ghost news-link">
+                        <h4 className="news-title-button">{article.title}</h4>
+                        <a
+                          href={article.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="button ghost news-link"
+                          onClick={(event) => event.stopPropagation()}
+                        >
                           查看来源
                         </a>
                       </div>
@@ -167,7 +290,7 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
                       <p className="muted">{article.summary}</p>
                       {article.originalTitle && article.originalTitle !== article.title ? <p className="meta">原标题：{article.originalTitle}</p> : null}
                     </article>
-                  ))}
+                  )})}
                 </div>
               )}
             </section>
@@ -192,7 +315,7 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
               <span>{new Date(activeArticle.publishedAt).toLocaleString("zh-CN")}</span>
             </p>
 
-            {loadingArticleId === activeArticle.id ? <div className="empty">正在生成浓缩信息...</div> : null}
+            {loadingArticleId === activeArticle.id ? <div className="empty">正在读取浓缩信息...</div> : null}
             {briefError ? <div className="empty">{briefError}</div> : null}
 
             {!loadingArticleId && activeBrief ? (
@@ -214,7 +337,7 @@ export function DigestCard({ digest }: { digest: DailyDigestView }) {
               <a href={activeArticle.url} target="_blank" rel="noreferrer" className="button secondary">
                 查看原文
               </a>
-              <button type="button" className="button ghost" onClick={() => void openBrief(activeArticle)}>
+              <button type="button" className="button ghost" onClick={() => void openBrief(activeArticle, { forceRefresh: true })}>
                 重新生成浓缩
               </button>
             </div>
