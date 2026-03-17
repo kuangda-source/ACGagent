@@ -21,7 +21,7 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
 
   return {
     digest,
-    recentQueries: store.recentQueries.slice(0, 6),
+    recentQueries: store.recentQueries.slice(0, 30),
     recommendationHighlights: recommendationHighlights.slice(0, 3),
     librarySummary: {
       totalFiles: lastScan?.entries.length ?? 0,

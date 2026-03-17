@@ -44,6 +44,8 @@ export interface NewsArticleSummary {
   title: string;
   url: string;
   summary: string;
+  brief?: string;
+  keyPoints?: string[];
   category: string;
   sourceName: string;
   publishedAt: string;

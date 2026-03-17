@@ -8,11 +8,18 @@ const payloadSchema = z.object({
 });
 
 export async function POST(request: Request) {
+  let payload: z.infer<typeof payloadSchema>;
+
   try {
-    const payload = payloadSchema.parse(await request.json());
+    payload = payloadSchema.parse(await request.json());
+  } catch {
+    return NextResponse.json({ error: "请求参数不合法。" }, { status: 400 });
+  }
+
+  try {
     const result = await askWork(payload.query, payload.type);
     return NextResponse.json(result);
   } catch {
-    return NextResponse.json({ error: "请求参数不合法。" }, { status: 400 });
+    return NextResponse.json({ error: "查询失败，请稍后重试。" }, { status: 500 });
   }
 }

@@ -1,5 +1,11 @@
-﻿import type { AppSettings, DailyDigestView, LibraryScanResult, RecommendationResult, WorkType } from "@/lib/types";
+import type { AppSettings, DailyDigestView, LibraryScanResult, RecommendationResult, WorkDetail, WorkType } from "@/lib/types";
 import { ensureServerEnv } from "@/server/env";
+
+interface AskCachedResult {
+  status: "found" | "not_found";
+  match?: WorkDetail;
+  suggestions?: string[];
+}
 
 interface AppStore {
   settings: AppSettings;
@@ -7,6 +13,13 @@ interface AppStore {
     query: string;
     type: WorkType;
     answeredAt: string;
+  }>;
+  askResultCache: Array<{
+    key: string;
+    query: string;
+    type: WorkType;
+    result: AskCachedResult;
+    cachedAt: string;
   }>;
   latestDigest?: DailyDigestView;
   recommendationHistory: RecommendationResult[];
@@ -73,6 +86,7 @@ export function getAppStore(): AppStore {
     global.acgAgentStore = {
       settings: defaultSettings(),
       recentQueries: [],
+      askResultCache: [],
       recommendationHistory: []
     };
   }
